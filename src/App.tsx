@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { 
   FileText, 
   Settings2, 
@@ -21,10 +21,27 @@ import {
   Trash2,
   Columns,
   Maximize2,
-  Plus
+  Plus,
+  RefreshCw,
+  Search,
+  BookOpenText,
+  Sparkles
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { WorkflowStep, BOMItem, ProjectState } from './types';
+import { Toaster, toast } from 'sonner';
+import { 
+  WorkflowStep, 
+  BOMItem, 
+  ProjectState, 
+  ProjectSummary, 
+  ProjectMeta, 
+  Job, 
+  Entity, 
+  BOM, 
+  Estimate 
+} from './types';
+import { api } from './services/api';
+import { PdfSourceViewer } from './components/PdfSourceViewer';
 
 // Components
 const StepIndicator = ({ current, step, icon: Icon, label }: { current: WorkflowStep, step: WorkflowStep, icon: any, label: string }) => {
@@ -43,21 +60,103 @@ const StepIndicator = ({ current, step, icon: Icon, label }: { current: Workflow
 };
 
 export default function App() {
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [meta, setMeta] = useState<ProjectMeta | null>(null);
+  const [entities, setEntities] = useState<Entity[]>([]);
+  const [bom, setBom] = useState<BOM | null>(null);
+  const [estimate, setEstimate] = useState<Estimate | null>(null);
+  
   const [project, setProject] = useState<ProjectState>({
-    id: '1',
-    name: '5ВРУ_Общежитие_v2',
+    id: '', 
+    name: 'Новый проект',
     currentStep: 'upload',
     analysisMode: 'ai',
     pdfFile: null,
-    pagesRange: '',
+    pagesRange: '47-71',
     instructions: '',
     status: 'idle',
     statusMessage: '',
   });
 
-  const [splitPosition, setSplitPosition] = useState(40); // PDF viewer width %
+  const [splitPosition, setSplitPosition] = useState(40);
   const [isResizing, setIsResizing] = useState(false);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
+  const [selectedEntityId, setSelectedEntityId] = useState('');
+  const [viewerPage, setViewerPage] = useState<number | null>(null);
+
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // Derived data
+  const currentDoc = meta?.documents?.at(-1);
+  const pdfUrl = useMemo(() => {
+    if (!project.id || !currentDoc) return '';
+    return api.documents.fileUrl(project.id, currentDoc.document_id);
+  }, [project.id, currentDoc]);
+
+  const sourceEvidence = useMemo(() => {
+    if (!Array.isArray(entities)) return [];
+    return entities.flatMap(e => e.sources || []);
+  }, [entities]);
+
+  // Initial Load
+  useEffect(() => {
+    async function init() {
+      try {
+        const list = await api.projects.list();
+        setProjects(list);
+        if (list.length > 0) {
+          const first = list[0];
+          setProject(prev => ({ ...prev, id: first.project_id, name: first.name }));
+          await loadProjectData(first.project_id);
+        }
+      } catch (err) {
+        console.error('Failed to load projects', err);
+      }
+    }
+    init();
+  }, []);
+
+  async function loadProjectData(projectId: string) {
+    try {
+      const [projectMeta, entityList] = await Promise.all([
+        api.projects.get(projectId),
+        api.entities.list(projectId),
+      ]);
+      setMeta(projectMeta);
+      setEntities(Array.isArray(entityList) ? entityList : []);
+      
+      try {
+        const b = await api.bom.get(projectId);
+        setBom(b);
+        // Map API BOM to UI-friendly BOMItems if needed
+        const mappedResults: BOMItem[] = b.items.map((item, idx) => ({
+          ...item,
+          id: `bom-${idx}`,
+          article: (item.params?.article as string) || item.designation || '—',
+          manufacturer: (item.params?.manufacturer as string) || '—',
+          price: 0, // Estimating logic usually comes from estimate object
+          total: 0
+        }));
+        
+        try {
+          const est = await api.estimate.get(projectId);
+          setEstimate(est);
+          // If we have an estimate, we could theoretically populate prices here
+          // but for now we follow the user's manual editing logic too
+        } catch (e) { /* ignore */ }
+
+        setProject(prev => ({ 
+          ...prev, 
+          results: mappedResults,
+          currentStep: mappedResults.length > 0 ? 'result' : prev.currentStep
+        }));
+      } catch (e) {
+        setBom(null);
+      }
+    } catch (err) {
+      toast.error('Ошибка загрузки данных проекта');
+    }
+  }
 
   // BOM Handlers
   const handleUpdateItem = (id: string, updates: Partial<BOMItem>) => {
@@ -66,9 +165,8 @@ export default function App() {
       results: prev.results?.map(item => {
         if (item.id === id) {
           const newItem = { ...item, ...updates };
-          // Auto-recalculate total if quantity or price changed
-          if ('quantity' in updates || 'price' in updates) {
-            newItem.total = newItem.quantity * newItem.price;
+          if ('qty' in updates || 'price' in updates) {
+            newItem.total = (newItem.qty || 0) * (newItem.price || 0);
           }
           return newItem;
         }
@@ -90,10 +188,18 @@ export default function App() {
       name: 'Новая позиция',
       article: '—',
       manufacturer: '—',
-      quantity: 1,
+      qty: 1,
       unit: 'шт',
       price: 0,
-      total: 0
+      total: 0,
+      entity_type: 'custom',
+      designation: '',
+      params: {},
+      entity_ids: [],
+      source_type: 'manual',
+      origin: 'user',
+      review_status: 'new',
+      confidence: 1
     };
     setProject(prev => ({
       ...prev,
@@ -102,79 +208,76 @@ export default function App() {
     setEditingItemId(newItem.id);
   };
 
-  // Handlers
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
+    if (!file) return;
+
+    try {
+      let projectId = project.id;
+      if (!projectId) {
+        const newProj = await api.projects.create(file.name.replace('.pdf', ''), 'all_electrical');
+        projectId = newProj.project_id;
+        setProject(prev => ({ ...prev, id: projectId, name: newProj.name }));
+      }
+
+      setProject(prev => ({ ...prev, status: 'processing', statusMessage: 'Загрузка файла...' }));
+      await api.projects.upload(projectId, file, 'web');
+      
+      toast.success('Файл успешно загружен');
+      await loadProjectData(projectId);
+      
       setProject(prev => ({ 
         ...prev, 
         pdfFile: file, 
         currentStep: 'config', 
+        status: 'idle',
         statusMessage: 'Документ загружен' 
       }));
+    } catch (err) {
+      toast.error('Ошибка загрузки: ' + (err instanceof Error ? err.message : String(err)));
+      setProject(prev => ({ ...prev, status: 'error', error: 'Не удалось загрузить файл' }));
     }
   };
 
   const startAnalysis = async () => {
-    // Check for "error" trigger in instructions for demo
-    if (project.instructions.toLowerCase().includes('error')) {
-      setProject(prev => ({ 
-        ...prev, 
-        currentStep: 'analysis', 
-        status: 'processing', 
-        statusMessage: 'Подготовка к анализу...' 
-      }));
-      await new Promise(r => setTimeout(r, 2000));
-      setProject(prev => ({ 
-        ...prev, 
-        status: 'error', 
-        error: 'Сервер перегружен или файл слишком сложный. Пожалуйста, попробуйте повторить запрос позже.',
-        statusMessage: 'Ошибка обработки'
-      }));
-      return;
-    }
+    if (!project.id) return;
 
     setProject(prev => ({ 
       ...prev, 
       currentStep: 'analysis', 
       status: 'processing', 
-      statusMessage: project.analysisMode === 'ai' ? 'Агент анализирует чертежи...' : 'Извлечение текста...' 
+      statusMessage: 'Агент готовится к разбору...' 
     }));
 
-    const aiStages = [
-      { msg: 'Распознавание структуры документа...', time: 1500 },
-      { msg: 'Поиск схем на стр. 47...', time: 2000 },
-      { msg: 'Сверка с номенклатурой...', time: 2500 },
-      { msg: 'Финальный расчет...', time: 1000 },
-    ];
+    try {
+      // Step 1: Extract entities
+      setProject(prev => ({ ...prev, statusMessage: 'Извлекаем данные из PDF...' }));
+      await api.projects.runExtract(project.id);
+      
+      // Step 2: Build BOM
+      setProject(prev => ({ ...prev, statusMessage: 'Формируем спецификацию...' }));
+      const newBom = await api.bom.build(project.id);
+      setBom(newBom);
 
-    const basicStages = [
-      { msg: 'Сканирование (Fast OCR)...', time: 1000 },
-      { msg: 'Поиск ключевых слов...', time: 1000 },
-    ];
+      // Refresh project data
+      await loadProjectData(project.id);
 
-    const activeStages = project.analysisMode === 'ai' ? aiStages : basicStages;
-
-    for (const stage of activeStages) {
-      await new Promise(r => setTimeout(r, stage.time));
-      setProject(prev => ({ ...prev, statusMessage: stage.msg }));
+      toast.success('Инженерный разбор завершен');
+      setProject(prev => ({ 
+        ...prev, 
+        currentStep: 'result', 
+        status: 'success'
+      }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error('Критическая ошибка: ' + msg);
+      setProject(prev => ({ 
+        ...prev, 
+        status: 'error', 
+        error: msg,
+        statusMessage: 'Ошибка обработки'
+      }));
     }
-
-    const mockResults: BOMItem[] = project.analysisMode === 'ai' ? [
-      { id: '1', name: 'Автоматический выключатель iK60N 3P 25A C', article: 'A9F74325', manufacturer: 'System Electric', quantity: 2, unit: 'шт', price: 1450, total: 2900 },
-      { id: '2', name: 'Шкаф напольный 2000х600х600 IP55', article: 'DKS-FS-2066', manufacturer: 'DKS', quantity: 1, unit: 'шт', price: 42000, total: 42000 },
-      { id: '3', name: 'Шина медная 20х3мм', article: 'BUS-CU-203', manufacturer: 'Электропром', quantity: 4, unit: 'м', price: 1200, total: 4800 },
-    ] : [
-      { id: '1', name: 'Автоматы 25А C', article: 'Не определено', manufacturer: 'Не определено', quantity: 2, unit: 'шт', price: 0, total: 0 },
-      { id: '2', name: 'Шкаф 2000х600х600', article: 'Не определено', manufacturer: 'Не определено', quantity: 1, unit: 'шт', price: 0, total: 0 },
-    ];
-
-    setProject(prev => ({ 
-      ...prev, 
-      currentStep: 'result', 
-      status: 'success', 
-      results: mockResults 
-    }));
   };
 
   // Split View Resize
@@ -227,52 +330,30 @@ export default function App() {
           className="bg-[#525659] flex flex-col items-center overflow-hidden border-r border-[#E2E8F0] relative"
           style={{ width: `${splitPosition}%` }}
         >
-          <div className="w-full h-[48px] bg-white border-b border-[#E2E8F0] flex items-center justify-between px-4 shrink-0 shadow-sm z-10 transition-colors">
-            <span className="text-[12px] font-bold text-[#64748B] uppercase tracking-wider">Просмотр документа</span>
-            {project.pdfFile && (
-              <span className="bg-[#EFF6FF] text-[#2563EB] px-2 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider">
-                стр. 47 из 124
-              </span>
-            )}
-          </div>
-          
-          <div className="flex-1 w-full overflow-auto p-12 flex flex-col items-center gap-6 scrollbar-hide">
-            {project.pdfFile ? (
-              <div className="w-[340px] aspect-[1/1.41] bg-white shadow-[0_4px_12px_rgba(0,0,0,0.2)] rounded-sm p-8 flex flex-col gap-4 relative shrink-0">
-                <div className="w-full h-[140px] border-2 border-dashed border-[#E2E8F0] rounded-lg flex flex-col items-center justify-center text-[#94A3B8]">
-                   <span className="text-[10px] font-bold uppercase tracking-[0.2em]">[СХЕМА ВП1]</span>
-                </div>
-                <div className="h-2 bg-[#F1F5F9] rounded-full w-[80%]" />
-                <div className="h-2 bg-[#F1F5F9] rounded-full w-[90%]" />
-                <div className="h-2 bg-[#F1F5F9] rounded-full w-[40%]" />
-                <div className="h-2 bg-[#F1F5F9] rounded-full w-[70%]" />
-
-                <div className="mt-auto pt-4 border-t border-[#E2E8F0] flex flex-col gap-2">
-                  <div className="h-2 bg-[#F1F5F9] rounded-full w-[30%]" />
-                  <div className="h-2 bg-[#F1F5F9] rounded-full w-[100%]" />
+          {pdfUrl ? (
+            <PdfSourceViewer 
+              pdfUrl={pdfUrl} 
+              page={viewerPage} 
+              sources={sourceEvidence} 
+              onPageChange={setViewerPage} 
+            />
+          ) : (
+            <>
+              <div className="w-full h-[48px] bg-white border-b border-[#E2E8F0] flex items-center justify-between px-4 shrink-0 shadow-sm z-10 transition-colors">
+                <span className="text-[12px] font-bold text-[#64748B] uppercase tracking-wider">Просмотр документа</span>
+              </div>
+              
+              <div className="flex-1 w-full overflow-auto p-12 flex flex-col items-center gap-6 scrollbar-hide">
+                <div className="mt-20 text-center group cursor-pointer" onClick={() => fileRef.current?.click()}>
+                  <div className="w-20 h-20 bg-white/10 backdrop-blur rounded-3xl border border-white/20 flex items-center justify-center text-white/50 mx-auto mb-4 group-hover:scale-105 transition-transform duration-500">
+                    <Upload size={32} />
+                  </div>
+                  <p className="text-white/60 text-sm font-medium">Выберите PDF для просмотра</p>
+                  <input ref={fileRef} type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} />
                 </div>
               </div>
-            ) : (
-              <div className="mt-20 text-center group cursor-pointer" onClick={() => document.getElementById('file-upload')?.click()}>
-                <div className="w-20 h-20 bg-white/10 backdrop-blur rounded-3xl border border-white/20 flex items-center justify-center text-white/50 mx-auto mb-4 group-hover:scale-105 transition-transform duration-500">
-                  <Upload size={32} />
-                </div>
-                <p className="text-white/60 text-sm font-medium">Выберите PDF для просмотра</p>
-                <input id="file-upload" type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} />
-              </div>
-            )}
-            
-            {project.pdfFile && (
-               <div className="bg-black/50 backdrop-blur-md px-4 py-2 rounded-full text-white text-[12px] font-medium shadow-lg flex items-center gap-3">
-                 <span>Инструменты:</span>
-                 <button className="hover:text-[#2563EB]">Масштаб</button>
-                 <span className="opacity-20">|</span>
-                 <button className="hover:text-[#2563EB]">Поиск</button>
-                 <span className="opacity-20">|</span>
-                 <button className="hover:text-[#2563EB]">Печать</button>
-               </div>
-            )}
-          </div>
+            </>
+          )}
         </div>
 
         {/* Resizer */}
@@ -389,12 +470,20 @@ export default function App() {
                   <div className="bg-[#F0F9FF] border border-[#B9E6FE] rounded-2xl p-8 flex items-start gap-6 max-w-lg text-left shadow-sm">
                     <div className="w-6 h-6 border-2 border-[#BAE6FD] border-t-[#0284C7] rounded-full animate-spin shrink-0" />
                     <div>
-                      <h4 className="font-bold text-[16px] text-[#0369A1] mb-1">Идет распознавание документа...</h4>
+                      <h4 className="font-bold text-[16px] text-[#0369A1] mb-1">Идет инженерный разбор...</h4>
                       <p className="text-sm text-[#0C4A6E] leading-relaxed mb-4">
-                        {project.statusMessage || 'Анализируем схемы и сверяем с номенклатурой производителя.'}
+                        {project.statusMessage || 'Анализируем PDF и формируем спецификацию оборудования.'}
                       </p>
+                      <div className="w-full bg-[#BAE6FD] h-1.5 rounded-full overflow-hidden mb-4">
+                        <motion.div 
+                          className="h-full bg-[#0284C7]"
+                          initial={{ width: "0%" }}
+                          animate={{ width: "100%" }}
+                          transition={{ duration: 45, ease: "linear" }}
+                        />
+                      </div>
                       <span className="text-[11px] font-bold uppercase tracking-widest text-[#0C4A6E] opacity-50 italic">
-                        Расчет может занять до 2 минут. Не закрывайте вкладку.
+                        Фоновое извлечение может занять до 60 секунд.
                       </span>
                     </div>
                   </div>
@@ -487,14 +576,14 @@ export default function App() {
                                 <div className="flex items-center justify-center gap-1">
                                   <input 
                                     type="number"
-                                    value={item.quantity}
-                                    onChange={(e) => handleUpdateItem(item.id, { quantity: Number(e.target.value) })}
+                                    value={item.qty}
+                                    onChange={(e) => handleUpdateItem(item.id, { qty: Number(e.target.value) })}
                                     className="w-14 bg-white border border-indigo-200 rounded px-2 py-1 text-center"
                                   />
                                   <span className="text-[10px] text-slate-400">{item.unit}</span>
                                 </div>
                               ) : (
-                                <span className="text-[#1E293B] font-bold italic">{item.quantity} {item.unit}</span>
+                                <span className="text-[#1E293B] font-bold italic">{item.qty} {item.unit}</span>
                               )}
                             </td>
                             <td className="px-6 py-3 text-right">
@@ -585,6 +674,7 @@ export default function App() {
           </footer>
         </div>
       </main>
+      <Toaster position="bottom-right" theme="light" expand richColors />
     </div>
   );
 }
