@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
+  GripVertical,
   RefreshCw,
   Trash2,
-  Upload,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
+import { EmptyState } from './components/EmptyState';
 import { CatalogsPage } from './components/catalogs/CatalogsPage';
 import { PdfSourceViewer } from './components/PdfSourceViewer';
 import { WorkflowWorkspace } from './components/WorkflowView';
@@ -810,6 +811,18 @@ export default function App() {
     reviewStatusLabel,
   });
 
+  const handleEmptyStateUpload = useCallback((file: File) => {
+    void handleUpload(file);
+  }, [handleUpload]);
+
+  const handleNewDocument = useCallback(() => {
+    setWorkflow((current) => ({
+      ...current,
+      step: 'upload',
+    }));
+    fileRef.current?.click();
+  }, [fileRef]);
+
   const sourceEvidence = useMemo(
     () => (workflow.step === 'analysis' && selectedEntity ? selectedEntity.sources : []),
     [selectedEntity, workflow.step],
@@ -1166,26 +1179,34 @@ export default function App() {
             {selectedDocument ? (
               <PdfSourceViewer
                 pdfUrl={viewerUrl}
+                fileName={selectedDocument.filename}
                 page={viewerPage}
                 sources={sourceEvidence}
                 onPageChange={rememberViewerPage}
+                onNewDocument={handleNewDocument}
               />
             ) : (
               <div className="pdf-empty">
-                <Upload size={34} />
-                <h2>Загрузите PDF</h2>
-                <p>После загрузки документ появится здесь. Левая и правая части экрана регулируются перетаскиванием границы.</p>
+                <EmptyState
+                  disabled={!activeProjectId}
+                  uploading={uploading}
+                  onFileSelected={handleEmptyStateUpload}
+                />
               </div>
             )}
           </section>
 
           <div
-            className="split-resizer"
+            className="split-resizer group relative w-1 hover:w-1.5 transition-all bg-slate-200 hover:bg-blue-400 cursor-col-resize"
             onMouseDown={startResizing}
             role="separator"
             aria-orientation="vertical"
             aria-label="Изменить ширину просмотра PDF"
-          />
+          >
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-8 bg-white border border-slate-200 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 shadow-sm">
+              <GripVertical size={12} className="text-slate-400" />
+            </div>
+          </div>
 
           <WorkflowWorkspace
             upload={actionPaneProps.upload}

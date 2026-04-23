@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Minus, Plus, RotateCcw } from 'lucide-react';
+import { motion } from 'framer-motion';
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy, type RenderTask } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import PdfJsWorker from '../pdfjs-worker?worker';
+import { Toolbar } from './Toolbar';
 
 GlobalWorkerOptions.workerPort = new PdfJsWorker();
 
@@ -25,12 +26,14 @@ type HighlightRect = {
 
 type Props = {
   pdfUrl: string;
+  fileName: string;
   page: number | null;
   sources: SourceEvidence[];
   onPageChange: (page: number) => void;
+  onNewDocument: () => void;
 };
 
-export function PdfSourceViewer({ pdfUrl, page, sources, onPageChange }: Props) {
+export function PdfSourceViewer({ pdfUrl, fileName, page, sources, onPageChange, onNewDocument }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const renderTaskRef = useRef<RenderTask | null>(null);
@@ -226,77 +229,78 @@ export function PdfSourceViewer({ pdfUrl, page, sources, onPageChange }: Props) 
     setZoomLevel(Math.min(2.5, Math.max(0.5, Number(nextZoom.toFixed(2)))));
   };
 
+  const handlePrint = () => {
+    const printWindow = window.open(pdfUrl, '_blank', 'noopener,noreferrer');
+    printWindow?.addEventListener('load', () => printWindow.print(), { once: true });
+  };
+
+  const handleDownload = () => {
+    const link = document.createElement('a');
+    link.href = pdfUrl;
+    link.download = fileName || 'document.pdf';
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  };
+
   return (
     <div className="pdf-viewer-shell">
-      <div className="pdf-viewer-toolbar">
-        <label className="pdf-page-jump">
-          <span>Страница</span>
-          <input
-            value={pageInput}
-            onBlur={commitPageInput}
-            onChange={(event) => setPageInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.currentTarget.blur();
-              }
-            }}
-            inputMode="numeric"
-            pattern="[0-9]*"
-            disabled={!pageCount}
-          />
-          <strong>/ {pageCount || '?'}</strong>
-        </label>
-        <div className="pdf-zoom-controls">
-          <button className="pdf-control-button" onClick={() => updateZoom(zoomLevel - 0.1)} disabled={!pageCount} title="Уменьшить">
-            <Minus size={15} />
-          </button>
-          <button className="pdf-control-button pdf-control-button--wide" onClick={() => updateZoom(1)} disabled={!pageCount} title="Масштаб по ширине">
-            {Math.round(zoomLevel * 100)}%
-          </button>
-          <button className="pdf-control-button" onClick={() => updateZoom(zoomLevel + 0.1)} disabled={!pageCount} title="Увеличить">
-            <Plus size={15} />
-          </button>
-        </div>
-        <span className="badge badge-gray">{pageSources.length} source hits</span>
-      </div>
+      <Toolbar
+        fileName={fileName}
+        pageCount={pageCount}
+        pageInput={pageInput}
+        zoomPercent={Math.round(zoomLevel * 100)}
+        disabled={!pageCount}
+        canGoPrev={selectedPage > 1}
+        canGoNext={selectedPage < pageCount}
+        onPageInputChange={setPageInput}
+        onPageInputCommit={commitPageInput}
+        onPrevPage={() => goToPage(-1)}
+        onNextPage={() => goToPage(1)}
+        onZoomOut={() => updateZoom(zoomLevel - 0.1)}
+        onZoomReset={() => updateZoom(1)}
+        onZoomIn={() => updateZoom(zoomLevel + 0.1)}
+        onPrint={handlePrint}
+        onDownload={handleDownload}
+        onCloseOrNew={onNewDocument}
+      />
 
       <div ref={containerRef} className="pdf-viewer-frame">
         {loading ? <div className="pdf-state">Loading PDF...</div> : null}
         {error ? <div className="pdf-state error">{error}</div> : null}
         {!loading && !error && doc ? (
-          <div className="pdf-stage" style={{ width: `${pageWidth}px`, height: `${pageHeight}px` }}>
-            <canvas ref={canvasRef} className="pdf-canvas" />
-            <div className="pdf-overlay">
-              {highlightRects.map((rect) => (
-                <div
-                  key={rect.id}
-                  className="pdf-highlight"
-                  style={{
-                    left: `${rect.left}px`,
-                    top: `${rect.top}px`,
-                    width: `${rect.width}px`,
-                    height: `${rect.height}px`,
-                  }}
-                  title={rect.label}
-                />
-              ))}
-            </div>
+          <div className="bg-slate-100 p-8 min-h-full flex justify-center">
+            <motion.div
+              className="pdf-stage"
+              style={{ width: `${pageWidth}px`, height: `${pageHeight}px` }}
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ duration: 0.24, ease: 'easeOut' }}
+              key={`${pdfUrl}:${selectedPage}:${zoomLevel}`}
+            >
+              <canvas
+                ref={canvasRef}
+                className="pdf-canvas shadow-[0_0_50px_-12px_rgba(0,0,0,0.25)] border border-white/50 rounded-sm"
+              />
+              <div className="pdf-overlay">
+                {highlightRects.map((rect) => (
+                  <div
+                    key={rect.id}
+                    className="pdf-highlight"
+                    style={{
+                      left: `${rect.left}px`,
+                      top: `${rect.top}px`,
+                      width: `${rect.width}px`,
+                      height: `${rect.height}px`,
+                    }}
+                    title={rect.label}
+                  />
+                ))}
+              </div>
+            </motion.div>
           </div>
         ) : null}
-      </div>
-
-      <div className="pdf-viewer-controls">
-        <button className="pdf-control-button" onClick={() => onPageChange(1)} disabled={!pageCount} title="Первая страница">
-          <RotateCcw size={15} />
-          <span>1</span>
-        </button>
-        <button className="pdf-control-button" onClick={() => goToPage(-1)} disabled={!pageCount || selectedPage <= 1} title="Предыдущая страница">
-          <ChevronLeft size={17} />
-        </button>
-        <span className="pdf-page-meter">{selectedPage}{pageCount ? ` / ${pageCount}` : ''}</span>
-        <button className="pdf-control-button" onClick={() => goToPage(1)} disabled={!pageCount || selectedPage >= pageCount} title="Следующая страница">
-          <ChevronRight size={17} />
-        </button>
       </div>
     </div>
   );

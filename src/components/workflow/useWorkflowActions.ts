@@ -152,12 +152,12 @@ export function useWorkflowActions(args: UseWorkflowActionsArgs) {
     }
   }
 
-  async function handleUpload() {
+  async function handleUpload(fileOverride?: File) {
     if (!args.activeProjectId) {
       toast.error('Сначала выберите или создайте проект');
       return;
     }
-    const file = args.fileRef.current?.files?.[0];
+    const file = fileOverride ?? args.fileRef.current?.files?.[0];
     if (!file) {
       toast.error('Выберите PDF файл');
       return;
@@ -165,7 +165,7 @@ export function useWorkflowActions(args: UseWorkflowActionsArgs) {
     args.setUploading(true);
     try {
       await api.projects.upload(args.activeProjectId, file, 'web');
-      toast.success('PDF загружен');
+      toast.success('Документ загружен');
       if (args.fileRef.current) args.fileRef.current.value = '';
       await args.loadProject(args.activeProjectId);
     } catch (error) {
