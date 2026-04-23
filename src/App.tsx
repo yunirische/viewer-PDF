@@ -1,292 +1,485 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { 
-  FileText, 
-  Settings2, 
-  Cpu, 
-  ClipboardCheck, 
-  Upload, 
-  ArrowRight, 
-  CheckCircle2, 
-  AlertCircle, 
-  Loader2, 
-  ChevronLeft, 
-  MoreHorizontal,
-  Download,
-  Share2,
-  Trash2,
-  Columns,
-  Maximize2,
-  Plus,
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  CheckCircle2,
   RefreshCw,
-  Search,
-  BookOpenText,
-  Sparkles
+  Trash2,
+  Upload,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
-import { Toaster, toast } from 'sonner';
-import { 
-  WorkflowStep, 
-  BOMItem, 
-  ProjectState, 
-  ProjectSummary, 
-  ProjectMeta, 
-  Job, 
-  Entity, 
-  BOM, 
-  Estimate 
-} from './types';
-import { api } from './services/api';
+import { toast } from 'sonner';
+
+import { CatalogsPage } from './components/catalogs/CatalogsPage';
 import { PdfSourceViewer } from './components/PdfSourceViewer';
+import { WorkflowWorkspace } from './components/WorkflowView';
+import type { Scope, WorkflowSession, WorkflowStep } from './components/workflow/types';
+import { createWorkflowActionPaneViewModel, createWorkflowDetailRailViewModel, deriveWorkflowState } from './components/workflow/viewModels';
+import { useWorkflowActions } from './components/workflow/useWorkflowActions';
+import { useWorkflowData } from './components/workflow/useWorkflowData';
+import { api } from './services/api';
+import type {
+  BOM,
+  ClarificationItem,
+  Entity,
+  Estimate,
+  ExtractionMode,
+  FileBrowserInboxFile,
+  FileBrowserPriceFile,
+  Job,
+  ProjectMeta,
+  ProjectSummary,
+  SelectionRecord,
+  SupplierCatalog,
+  SupplierCatalogImportPreview,
+  SupplierCatalogSummary,
+} from './types';
 
-// Components
-const StepIndicator = ({ current, step, icon: Icon, label }: { current: WorkflowStep, step: WorkflowStep, icon: any, label: string }) => {
-  const isActive = current === step;
-  const isCompleted = ['upload', 'config', 'analysis', 'result'].indexOf(current) > ['upload', 'config', 'analysis', 'result'].indexOf(step);
+const scopeOptions: Scope[] = ['all_electrical', 'panel_only', 'supply_only', 'custom'];
+const workflowSteps: Array<{ step: WorkflowStep; label: string }> = [
+  { step: 'upload', label: 'Загрузка' },
+  { step: 'config', label: 'Настройка' },
+  { step: 'clarification', label: 'Уточнение' },
+  { step: 'analysis', label: 'Обработка' },
+  { step: 'result', label: 'Результат' },
+];
+const extractionModeOptions: Array<{
+  mode: ExtractionMode;
+  title: string;
+  text: string;
+  enabled: boolean;
+}> = [
+  {
+    mode: 'code',
+    title: 'Код',
+    text: 'Базовый локальный разбор: строит кандидатов и источники, но для сложных PDF это запасной режим.',
+    enabled: true,
+  },
+  {
+    mode: 'agent',
+    title: 'Агент',
+    text: 'Агент читает выбранные страницы напрямую. Подходит для точечных проверок без подготовленного контекста.',
+    enabled: true,
+  },
+  {
+    mode: 'combined',
+    title: 'Код + агент',
+    text: 'Основной режим: широкий черновой проход, затем проверка позиций и отдельный узкий анализ.',
+    enabled: true,
+  },
+];
 
-  return (
-    <div className={`flex items-center gap-2 px-3 py-2 transition-all duration-300 ${isActive ? 'text-[var(--color-primary)]' : 'text-[#94A3B8]'}`}>
-      <span className={`text-sm font-bold ${isActive ? 'text-[var(--color-primary)]' : isCompleted ? 'text-[#10B981]' : 'text-inherit'}`}>
-        {step === 'upload' ? '01' : step === 'config' ? '02' : step === 'analysis' ? '03' : '04'}
-      </span>
-      <span className="text-sm font-medium whitespace-nowrap uppercase tracking-wide">{label}</span>
-      {isCompleted && <CheckCircle2 size={14} className="text-[#10B981] ml-1" />}
-    </div>
-  );
-};
-
-export default function App() {
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [meta, setMeta] = useState<ProjectMeta | null>(null);
-  const [entities, setEntities] = useState<Entity[]>([]);
-  const [bom, setBom] = useState<BOM | null>(null);
-  const [estimate, setEstimate] = useState<Estimate | null>(null);
-  
-  const [project, setProject] = useState<ProjectState>({
-    id: '', 
-    name: 'Новый проект',
-    currentStep: 'upload',
-    analysisMode: 'ai',
-    pdfFile: null,
-    pagesRange: '47-71',
-    instructions: '',
-    status: 'idle',
-    statusMessage: '',
+function formatDate(value: string | null | undefined): string {
+  if (!value) return '—';
+  return new Date(value).toLocaleString('ru-RU', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
   });
+}
 
-  const [splitPosition, setSplitPosition] = useState(40);
-  const [isResizing, setIsResizing] = useState(false);
-  const [editingItemId, setEditingItemId] = useState<string | null>(null);
-  const [selectedEntityId, setSelectedEntityId] = useState('');
-  const [viewerPage, setViewerPage] = useState<number | null>(null);
+function scopeLabel(scope: string): string {
+  const labels: Record<string, string> = {
+    all_electrical: 'Все электрические разделы',
+    panel_only: 'Щиты и панели',
+    supply_only: 'Ввод и питание',
+    custom: 'По описанию ниже',
+  };
+  return labels[scope] ?? scope.replaceAll('_', ' ');
+}
 
-  const fileRef = useRef<HTMLInputElement>(null);
+function statusLabel(status: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    done: 'Готово',
+    succeeded: 'Готово',
+    failed: 'Ошибка',
+    running: 'В работе',
+    processing: 'В работе',
+    pending: 'Ожидает',
+    queued: 'В очереди',
+    uploaded: 'Загружено',
+    cancelled: 'Отменено',
+    idle: 'Не запускалось',
+    priced: 'Смета готова',
+    needs_review: 'Нужна проверка',
+    needs_clarification: 'Нужно уточнение',
+  };
+  return labels[status || 'idle'] ?? (status || 'Не запускалось');
+}
 
-  // Derived data
-  const currentDoc = meta?.documents?.at(-1);
-  const pdfUrl = useMemo(() => {
-    if (!project.id || !currentDoc) return '';
-    return api.documents.fileUrl(project.id, currentDoc.document_id);
-  }, [project.id, currentDoc]);
+function statusTone(status: string | null | undefined): string {
+  if (status === 'done' || status === 'succeeded' || status === 'priced') return 'tone-success';
+  if (status === 'failed') return 'tone-danger';
+  if (status === 'needs_review' || status === 'needs_clarification') return 'tone-warn';
+  if (status === 'running' || status === 'processing' || status === 'pending' || status === 'queued') return 'tone-info';
+  return 'tone-muted';
+}
 
-  const sourceEvidence = useMemo(() => {
-    if (!Array.isArray(entities)) return [];
-    return entities.flatMap(e => e.sources || []);
-  }, [entities]);
+function summarizeJobIssue(job: Job | null | undefined): { title: string; detail: string; action: string; tone: string } | null {
+  if (!job) return null;
 
-  // Initial Load
-  useEffect(() => {
-    async function init() {
-      try {
-        const list = await api.projects.list();
-        setProjects(list);
-        if (list.length > 0) {
-          const first = list[0];
-          setProject(prev => ({ ...prev, id: first.project_id, name: first.name }));
-          await loadProjectData(first.project_id);
-        }
-      } catch (err) {
-        console.error('Failed to load projects', err);
-      }
-    }
-    init();
-  }, []);
-
-  async function loadProjectData(projectId: string) {
-    try {
-      const [projectMeta, entityList] = await Promise.all([
-        api.projects.get(projectId),
-        api.entities.list(projectId),
-      ]);
-      setMeta(projectMeta);
-      setEntities(Array.isArray(entityList) ? entityList : []);
-      
-      try {
-        const b = await api.bom.get(projectId);
-        setBom(b);
-        // Map API BOM to UI-friendly BOMItems if needed
-        const mappedResults: BOMItem[] = b.items.map((item, idx) => ({
-          ...item,
-          id: `bom-${idx}`,
-          article: (item.params?.article as string) || item.designation || '—',
-          manufacturer: (item.params?.manufacturer as string) || '—',
-          price: 0, // Estimating logic usually comes from estimate object
-          total: 0
-        }));
-        
-        try {
-          const est = await api.estimate.get(projectId);
-          setEstimate(est);
-          // If we have an estimate, we could theoretically populate prices here
-          // but for now we follow the user's manual editing logic too
-        } catch (e) { /* ignore */ }
-
-        setProject(prev => ({ 
-          ...prev, 
-          results: mappedResults,
-          currentStep: mappedResults.length > 0 ? 'result' : prev.currentStep
-        }));
-      } catch (e) {
-        setBom(null);
-      }
-    } catch (err) {
-      toast.error('Ошибка загрузки данных проекта');
-    }
+  if (job.status === 'cancelled') {
+    return {
+      title: 'Разбор остановлен',
+      detail: job.steps.at(-1)?.note || 'Задача была отменена до завершения обработки.',
+      action: 'Проверьте диапазон страниц и режим, затем запустите разбор заново.',
+      tone: 'tone-muted',
+    };
   }
 
-  // BOM Handlers
-  const handleUpdateItem = (id: string, updates: Partial<BOMItem>) => {
-    setProject(prev => ({
-      ...prev,
-      results: prev.results?.map(item => {
-        if (item.id === id) {
-          const newItem = { ...item, ...updates };
-          if ('qty' in updates || 'price' in updates) {
-            newItem.total = (newItem.qty || 0) * (newItem.price || 0);
-          }
-          return newItem;
-        }
-        return item;
-      })
-    }));
-  };
+  if (job.status !== 'failed' && job.status !== 'needs_review' && job.status !== 'needs_clarification') return null;
 
-  const handleDeleteItem = (id: string) => {
-    setProject(prev => ({
-      ...prev,
-      results: prev.results?.filter(item => item.id !== id)
-    }));
-  };
-
-  const handleAddItem = () => {
-    const newItem: BOMItem = {
-      id: Math.random().toString(36).substr(2, 9),
-      name: 'Новая позиция',
-      article: '—',
-      manufacturer: '—',
-      qty: 1,
-      unit: 'шт',
-      price: 0,
-      total: 0,
-      entity_type: 'custom',
-      designation: '',
-      params: {},
-      entity_ids: [],
-      source_type: 'manual',
-      origin: 'user',
-      review_status: 'new',
-      confidence: 1
+  const raw = `${job.error || ''} ${job.steps.at(-1)?.note || ''} ${job.current_stage || ''}`.toLowerCase();
+  if (raw.includes('429') || raw.includes('rate') || raw.includes('quota') || raw.includes('limit')) {
+    return {
+      title: 'Лимит агента или провайдера',
+      detail: job.error || 'Внешний агент вернул ограничение по частоте или квоте.',
+      action: 'Повторите позже или временно переключитесь на `Код` / `Код + агент` с более узким диапазоном страниц.',
+      tone: 'tone-warn',
     };
-    setProject(prev => ({
-      ...prev,
-      results: [...(prev.results || []), newItem]
-    }));
-    setEditingItemId(newItem.id);
+  }
+  if (raw.includes('timeout') || raw.includes('timed out') || raw.includes('deadline')) {
+    return {
+      title: 'Разбор не уложился во время ожидания',
+      detail: job.error || 'Фоновая задача зависла или внешний сервис слишком долго отвечал.',
+      action: 'Сузьте диапазон страниц и повторите запуск. Для тяжёлых страниц лучше идти меньшими пачками.',
+      tone: 'tone-warn',
+    };
+  }
+  if (raw.includes('pair') || raw.includes('device') || raw.includes('token') || raw.includes('gateway') || raw.includes('provider') || raw.includes('model') || raw.includes('auth')) {
+    return {
+      title: 'Проблема доступа к агенту',
+      detail: job.error || 'Agent/Gateway не принял запрос.',
+      action: 'Проверьте доступность OpenClaw/provider или временно используйте локальный режим `Код`.',
+      tone: 'tone-danger',
+    };
+  }
+  if (raw.includes('json') || raw.includes('schema') || raw.includes('parse') || raw.includes('validation')) {
+    return {
+      title: 'Ответ агента требует ручной проверки',
+      detail: job.error || 'Структурированный ответ оказался неполным или не прошёл валидацию.',
+      action: 'Перезапустите разбор на меньшем диапазоне страниц или перейдите на локальный режим для baseline-результата.',
+      tone: 'tone-warn',
+    };
+  }
+
+  return {
+    title: job.status === 'needs_clarification'
+      ? 'Разбор требует уточнения'
+      : job.status === 'needs_review'
+        ? 'Разбор требует внимания'
+        : 'Разбор завершился ошибкой',
+    detail: job.error || job.steps.at(-1)?.note || 'Фоновая задача не завершилась штатно.',
+    action: job.status === 'needs_clarification'
+      ? 'Сначала ответьте на уточняющие вопросы по спорным строкам, затем продолжайте обычную ручную проверку.'
+      : 'Проверьте режим, диапазон страниц и повторите запуск. Если ошибка повторяется, используйте более узкий диапазон или другой режим.',
+    tone: job.status === 'needs_review' || job.status === 'needs_clarification' ? 'tone-warn' : 'tone-danger',
   };
+}
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+function extractionModeLabel(mode: ExtractionMode | string | null | undefined): string {
+  if (mode === 'combined') return 'Код + агент';
+  if (mode === 'agent') return 'Агент';
+  if (mode === 'code') return 'Код';
+  return mode || '—';
+}
 
-    try {
-      let projectId = project.id;
-      if (!projectId) {
-        const newProj = await api.projects.create(file.name.replace('.pdf', ''), 'all_electrical');
-        projectId = newProj.project_id;
-        setProject(prev => ({ ...prev, id: projectId, name: newProj.name }));
-      }
+function pageRangeText(pageFrom: number | null | undefined, pageTo: number | null | undefined): string {
+  if (pageFrom && pageTo) return `${pageFrom}-${pageTo}`;
+  if (pageFrom) return `c ${pageFrom}`;
+  if (pageTo) return `до ${pageTo}`;
+  return 'весь PDF';
+}
 
-      setProject(prev => ({ ...prev, status: 'processing', statusMessage: 'Загрузка файла...' }));
-      await api.projects.upload(projectId, file, 'web');
-      
-      toast.success('Файл успешно загружен');
-      await loadProjectData(projectId);
-      
-      setProject(prev => ({ 
-        ...prev, 
-        pdfFile: file, 
-        currentStep: 'config', 
-        status: 'idle',
-        statusMessage: 'Документ загружен' 
-      }));
-    } catch (err) {
-      toast.error('Ошибка загрузки: ' + (err instanceof Error ? err.message : String(err)));
-      setProject(prev => ({ ...prev, status: 'error', error: 'Не удалось загрузить файл' }));
+function reviewStatusLabel(status: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    draft: 'Черновик',
+    reviewed: 'Проверено',
+    rejected: 'Отклонено',
+  };
+  return labels[status || 'draft'] ?? (status || 'Черновик');
+}
+
+function sortJobsNewestFirst(items: Job[]): Job[] {
+  return [...items].sort((left, right) => {
+    const leftTime = Date.parse(left.updated_at || left.created_at || '');
+    const rightTime = Date.parse(right.updated_at || right.created_at || '');
+    return rightTime - leftTime;
+  });
+}
+
+function createWorkflowSession(projectId = ''): WorkflowSession {
+  return {
+    projectId,
+    documentId: '',
+    step: 'upload',
+    activeJobId: '',
+    extractionMode: 'combined',
+    pageFrom: '',
+    pageTo: '',
+    selectedEntityId: '',
+    reviewFilter: 'all',
+    quickQuery: '',
+  };
+}
+
+type AppMode = 'workflow' | 'catalogs';
+
+function StepIndicator({
+  current,
+  step,
+  label,
+  disabled,
+  onClick,
+}: {
+  current: WorkflowStep;
+  step: WorkflowStep;
+  label: string;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  const currentIndex = workflowSteps.findIndex((item) => item.step === current);
+  const stepIndex = workflowSteps.findIndex((item) => item.step === step);
+  const active = current === step;
+  const complete = stepIndex < currentIndex;
+
+  return (
+    <button
+      type="button"
+      className={`workflow-step ${active ? 'active' : ''} ${complete ? 'complete' : ''}`}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <span>{String(stepIndex + 1).padStart(2, '0')}</span>
+      <strong>{label}</strong>
+      {complete ? <CheckCircle2 size={14} /> : null}
+    </button>
+  );
+}
+
+export default function App() {
+  const [appMode, setAppMode] = useState<AppMode>('workflow');
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [project, setProject] = useState<ProjectMeta | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [entities, setEntities] = useState<Entity[]>([]);
+  const [clarifications, setClarifications] = useState<ClarificationItem[]>([]);
+  const [inboxFiles, setInboxFiles] = useState<FileBrowserInboxFile[]>([]);
+  const [selection, setSelection] = useState<SelectionRecord | null>(null);
+  const [bom, setBom] = useState<BOM | null>(null);
+  const [estimate, setEstimate] = useState<Estimate | null>(null);
+  const [workflow, setWorkflow] = useState<WorkflowSession>(() => createWorkflowSession());
+  const [viewerPage, setViewerPage] = useState<number | null>(null);
+  const [scope, setScope] = useState<Scope>('all_electrical');
+  const [loading, setLoading] = useState(true);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [loadingInbox, setLoadingInbox] = useState(false);
+  const [importingInbox, setImportingInbox] = useState(false);
+  const [inboxError, setInboxError] = useState('');
+  const [runningExtract, setRunningExtract] = useState(false);
+  const [activeExtractionJob, setActiveExtractionJob] = useState<Job | null>(null);
+  const [buildingBom, setBuildingBom] = useState(false);
+  const [pricingEstimate, setPricingEstimate] = useState(false);
+  const [savingInstructions, setSavingInstructions] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [selectedInboxPath, setSelectedInboxPath] = useState('');
+  const [extractionInstructions, setExtractionInstructions] = useState('');
+  const [analysisInstructions, setAnalysisInstructions] = useState('');
+  const [customScopeText, setCustomScopeText] = useState('');
+  const [assemblyMultiplier, setAssemblyMultiplier] = useState('2');
+  const [priceOverrides, setPriceOverrides] = useState<Record<string, string>>({});
+  const [splitPosition, setSplitPosition] = useState(40);
+  const [isResizing, setIsResizing] = useState(false);
+  const [savingEntity, setSavingEntity] = useState(false);
+  const [creatingEntity, setCreatingEntity] = useState(false);
+  const [approvingVisible, setApprovingVisible] = useState(false);
+  const [answeringClarificationId, setAnsweringClarificationId] = useState('');
+  const [applyingClarifications, setApplyingClarifications] = useState(false);
+  const [supplierCatalogs, setSupplierCatalogs] = useState<SupplierCatalogSummary[]>([]);
+  const [selectedCatalogId, setSelectedCatalogId] = useState('');
+  const [selectedSupplierCatalog, setSelectedSupplierCatalog] = useState<SupplierCatalog | null>(null);
+  const [loadingCatalogs, setLoadingCatalogs] = useState(false);
+  const [loadingCatalogDetail, setLoadingCatalogDetail] = useState(false);
+  const [catalogImportMode, setCatalogImportMode] = useState(false);
+  const [previewingCatalogImport, setPreviewingCatalogImport] = useState(false);
+  const [committingCatalogImport, setCommittingCatalogImport] = useState(false);
+  const [catalogImportPreview, setCatalogImportPreview] = useState<SupplierCatalogImportPreview | null>(null);
+  const [catalogImportMapping, setCatalogImportMapping] = useState<Record<string, string>>({});
+  const [catalogImportSupplierName, setCatalogImportSupplierName] = useState('');
+  const [catalogImportReference, setCatalogImportReference] = useState('');
+  const [catalogImportPriority, setCatalogImportPriority] = useState('100');
+  const [catalogImportNotes, setCatalogImportNotes] = useState('');
+  const [priceFiles, setPriceFiles] = useState<FileBrowserPriceFile[]>([]);
+  const [selectedPriceFilePath, setSelectedPriceFilePath] = useState('');
+  const [loadingPriceFiles, setLoadingPriceFiles] = useState(false);
+  const [priceFilesError, setPriceFilesError] = useState('');
+  const [entityForm, setEntityForm] = useState({
+    entity_type: 'load',
+    designation: '',
+    name: '',
+    qty: '1',
+    review_status: 'draft',
+  });
+  const [manualEntityForm, setManualEntityForm] = useState({
+    entity_type: 'load',
+    designation: '',
+    name: '',
+    qty: '1',
+  });
+
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const catalogImportFileRef = useRef<HTMLInputElement | null>(null);
+  const activeProjectId = workflow.projectId;
+  const selectedDocumentId = workflow.documentId;
+  const selectedEntityId = workflow.selectedEntityId;
+  const extractionMode = workflow.extractionMode;
+  const pageFrom = workflow.pageFrom;
+  const pageTo = workflow.pageTo;
+  const reviewFilter = workflow.reviewFilter;
+  const quickQuery = workflow.quickQuery;
+
+  const activeProject = useMemo(
+    () => projects.find((item) => item.project_id === activeProjectId) ?? null,
+    [projects, activeProjectId],
+  );
+
+  const documents = project?.documents ?? [];
+  const selectedDocument = useMemo(
+    () => documents.find((item) => item.document_id === selectedDocumentId) ?? documents.at(-1) ?? documents[0] ?? null,
+    [documents, selectedDocumentId],
+  );
+  const derivedWorkflow = useMemo(
+    () =>
+      deriveWorkflowState({
+        activeProjectId,
+        selectedDocumentId,
+        workflowStep: workflow.step,
+        documents,
+        jobs,
+        entities,
+        clarifications,
+        bom,
+        estimate,
+        activeExtractionJob,
+        selectedEntityId,
+        quickQuery,
+        reviewFilter,
+        runningExtract,
+        buildingBom,
+        pricingEstimate,
+        priceOverrides,
+        projectPriceSourcesCount: project?.price_sources.length ?? 0,
+        summarizeJobIssue,
+        statusLabel,
+      }),
+    [
+      activeExtractionJob,
+      activeProjectId,
+      bom,
+      buildingBom,
+      documents,
+      entities,
+      clarifications,
+      estimate,
+      jobs,
+      priceOverrides,
+      pricingEstimate,
+      project?.price_sources.length,
+      quickQuery,
+      reviewFilter,
+      runningExtract,
+      selectedDocumentId,
+      selectedEntityId,
+      workflow.step,
+    ],
+  );
+  const {
+    activeOrLatestExtractJob,
+    latestProjectReviewJob,
+    clarificationRequired,
+    clarifications: analysisClarifications,
+    openClarificationsCount,
+    reviewEntities,
+    selectedEntity,
+    canWork,
+    canExtract,
+    canBuildBom,
+    canBuildEstimate,
+    canExport,
+    draftCount,
+    reviewedCount,
+    rejectedCount,
+    visibleEntities,
+    nextDraftEntity,
+    currentStep,
+    extractionIssue,
+    processingMessage,
+    extractionProgress,
+    equipmentTotal,
+    totalCost,
+    bomPreviewItems,
+    hasBom,
+    estimateNotes,
+    activePriceOverrides,
+    priceSourcesCount,
+  } = derivedWorkflow;
+
+  const viewerUrl = useMemo(() => {
+    if (!activeProjectId || !selectedDocument) return '';
+    return new URL(
+      api.documents.fileUrl(activeProjectId, selectedDocument.document_id),
+      window.location.origin,
+    ).toString();
+  }, [activeProjectId, selectedDocument]);
+
+  const selectedDocumentPageKey = useMemo(() => {
+    if (!activeProjectId || !selectedDocument) return '';
+    return `pdf_spec.viewer_page.${activeProjectId}.${selectedDocument.document_id}`;
+  }, [activeProjectId, selectedDocument]);
+
+  const rememberViewerPage = useCallback((nextPage: number | null) => {
+    setViewerPage(nextPage);
+    if (nextPage && selectedDocumentPageKey) {
+      sessionStorage.setItem(selectedDocumentPageKey, String(nextPage));
     }
-  };
+  }, [selectedDocumentPageKey]);
 
-  const startAnalysis = async () => {
-    if (!project.id) return;
+  const { loadProject, loadInboxFiles, loadProjects } = useWorkflowData({
+    activeProjectId,
+    jobs,
+    workflow,
+    setWorkflow,
+    setProjects,
+    setProject,
+    setJobs,
+    setEntities,
+    setClarifications,
+    setInboxFiles,
+    setSelection,
+    setBom,
+    setEstimate,
+    setExtractionInstructions,
+    setAnalysisInstructions,
+    setCustomScopeText,
+    setScope,
+    setViewerPage,
+    setLoading,
+    setLoadingInbox,
+    setInboxError,
+    setSelectedInboxPath,
+    setActiveExtractionJob,
+    setRunningExtract,
+    createWorkflowSession,
+    sortJobsNewestFirst,
+    summarizeJobIssue,
+    statusLabel,
+    rememberViewerPage,
+  });
 
-    setProject(prev => ({ 
-      ...prev, 
-      currentStep: 'analysis', 
-      status: 'processing', 
-      statusMessage: 'Агент готовится к разбору...' 
-    }));
-
-    try {
-      // Step 1: Extract entities
-      setProject(prev => ({ ...prev, statusMessage: 'Извлекаем данные из PDF...' }));
-      await api.projects.runExtract(project.id);
-      
-      // Step 2: Build BOM
-      setProject(prev => ({ ...prev, statusMessage: 'Формируем спецификацию...' }));
-      const newBom = await api.bom.build(project.id);
-      setBom(newBom);
-
-      // Refresh project data
-      await loadProjectData(project.id);
-
-      toast.success('Инженерный разбор завершен');
-      setProject(prev => ({ 
-        ...prev, 
-        currentStep: 'result', 
-        status: 'success'
-      }));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error('Критическая ошибка: ' + msg);
-      setProject(prev => ({ 
-        ...prev, 
-        status: 'error', 
-        error: msg,
-        statusMessage: 'Ошибка обработки'
-      }));
-    }
-  };
-
-  // Split View Resize
   const startResizing = useCallback(() => setIsResizing(true), []);
   const stopResizing = useCallback(() => setIsResizing(false), []);
-  const resize = useCallback((e: MouseEvent) => {
-    if (isResizing) {
-      const newPos = (e.clientX / window.innerWidth) * 100;
-      if (newPos > 20 && newPos < 80) setSplitPosition(newPos);
+  const resize = useCallback((event: MouseEvent) => {
+    if (!isResizing) return;
+    const next = (event.clientX / window.innerWidth) * 100;
+    if (next >= 28 && next <= 68) {
+      setSplitPosition(next);
     }
   }, [isResizing]);
 
@@ -299,382 +492,772 @@ export default function App() {
     };
   }, [resize, stopResizing]);
 
+  useEffect(() => {
+    if (!selectedEntity) {
+      setEntityForm({
+        entity_type: 'load',
+        designation: '',
+        name: '',
+        qty: '1',
+        review_status: 'draft',
+      });
+      return;
+    }
+    setEntityForm({
+      entity_type: selectedEntity.entity_type || 'load',
+      designation: selectedEntity.designation || '',
+      name: selectedEntity.name || '',
+      qty: String(selectedEntity.qty || 1),
+      review_status: selectedEntity.review_status || 'draft',
+    });
+  }, [selectedEntity]);
+
+  useEffect(() => {
+    const nextOverrides: Record<string, string> = {};
+    for (const item of bom?.items ?? []) {
+      const key = item.designation || item.entity_ids[0] || item.name;
+      if (!key) continue;
+      if (item.price_override !== null && item.price_override !== undefined) {
+        nextOverrides[key] = String(item.price_override);
+      }
+    }
+    setPriceOverrides(nextOverrides);
+  }, [bom]);
+
+  const resetCatalogImportState = useCallback(() => {
+    setCatalogImportMode(false);
+    setCatalogImportPreview(null);
+    setCatalogImportMapping({});
+    setCatalogImportSupplierName('');
+    setCatalogImportReference('');
+    setCatalogImportPriority('100');
+    setCatalogImportNotes('');
+    setSelectedPriceFilePath('');
+    if (catalogImportFileRef.current) {
+      catalogImportFileRef.current.value = '';
+    }
+  }, []);
+
+  const resetCatalogImportPreview = useCallback(() => {
+    setCatalogImportPreview(null);
+    setCatalogImportMapping({});
+  }, []);
+
+  const loadPriceFiles = useCallback(async (force = false) => {
+    setLoadingPriceFiles(true);
+    setPriceFilesError('');
+    try {
+      const files = await api.filebrowser.prices(force);
+      setPriceFiles(files);
+      setSelectedPriceFilePath((current) => (
+        current && files.some((file) => file.path === current) ? current : ''
+      ));
+    } catch (error) {
+      setPriceFiles([]);
+      setSelectedPriceFilePath('');
+      setPriceFilesError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoadingPriceFiles(false);
+    }
+  }, []);
+
+  const loadSupplierCatalogs = useCallback(async (focusCatalogId?: string) => {
+    if (!activeProjectId) {
+      setSupplierCatalogs([]);
+      setSelectedCatalogId('');
+      setSelectedSupplierCatalog(null);
+      return;
+    }
+
+    setLoadingCatalogs(true);
+    try {
+      const list = await api.priceSources.listSupplierCatalogs(activeProjectId);
+      setSupplierCatalogs(list);
+
+      const nextSelectedId = focusCatalogId
+        ?? (list.some((item) => item.catalog_id === selectedCatalogId) ? selectedCatalogId : list[0]?.catalog_id ?? '');
+      setSelectedCatalogId(nextSelectedId);
+
+      if (!nextSelectedId) {
+        setSelectedSupplierCatalog(null);
+      }
+    } catch (error) {
+      toast.error(`Не удалось загрузить каталоги: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setLoadingCatalogs(false);
+    }
+  }, [activeProjectId, selectedCatalogId]);
+
+  const loadSupplierCatalogDetail = useCallback(async (catalogId: string) => {
+    if (!activeProjectId || !catalogId) {
+      setSelectedSupplierCatalog(null);
+      return;
+    }
+
+    setSelectedCatalogId(catalogId);
+    setLoadingCatalogDetail(true);
+    try {
+      const catalog = await api.priceSources.getSupplierCatalog(activeProjectId, catalogId);
+      setSelectedSupplierCatalog(catalog);
+    } catch (error) {
+      toast.error(`Не удалось открыть каталог: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setLoadingCatalogDetail(false);
+    }
+  }, [activeProjectId]);
+
+  const handlePreviewSupplierCatalogImport = useCallback(async () => {
+    if (!activeProjectId) {
+      toast.error('Сначала выберите проект.');
+      return;
+    }
+
+    const selectedPriceFile = priceFiles.find((item) => item.path === selectedPriceFilePath) ?? null;
+    const file = catalogImportFileRef.current?.files?.[0];
+    if (!file && !selectedPriceFile) {
+      toast.error('Выберите CSV/XLS/XLSX файл с компьютера или из FileBrowser/prices.');
+      return;
+    }
+    if (selectedPriceFile && !selectedPriceFile.supported_for_catalog_import) {
+      toast.error('PDF-прайс пока нельзя импортировать как каталог. Нужен CSV/XLS/XLSX/XLSM.');
+      return;
+    }
+
+    setPreviewingCatalogImport(true);
+    try {
+      const preview = selectedPriceFile
+        ? await api.priceSources.previewSupplierCatalogImportFromFileBrowser(activeProjectId, selectedPriceFile.path)
+        : await api.priceSources.previewSupplierCatalogImport(activeProjectId, file as File);
+      setCatalogImportPreview(preview);
+      setCatalogImportMapping(preview.suggested_mapping ?? {});
+      if (!catalogImportReference.trim()) {
+        setCatalogImportReference(selectedPriceFile?.path || preview.filename);
+      }
+    } catch (error) {
+      toast.error(`Не удалось прочитать каталог: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setPreviewingCatalogImport(false);
+    }
+  }, [activeProjectId, catalogImportReference, priceFiles, selectedPriceFilePath]);
+
+  const handleCommitSupplierCatalogImport = useCallback(async () => {
+    if (!activeProjectId) {
+      toast.error('Сначала выберите проект.');
+      return;
+    }
+    const selectedPriceFile = priceFiles.find((item) => item.path === selectedPriceFilePath) ?? null;
+    const file = catalogImportFileRef.current?.files?.[0];
+    if (!file && !selectedPriceFile) {
+      toast.error('Выберите CSV/XLS/XLSX файл с компьютера или из FileBrowser/prices.');
+      return;
+    }
+    if (selectedPriceFile && !selectedPriceFile.supported_for_catalog_import) {
+      toast.error('PDF-прайс пока нельзя импортировать как каталог. Нужен CSV/XLS/XLSX/XLSM.');
+      return;
+    }
+    if (!catalogImportPreview) {
+      toast.error('Сначала откройте preview и проверьте mapping.');
+      return;
+    }
+    if (!catalogImportSupplierName.trim()) {
+      toast.error('Укажите поставщика.');
+      return;
+    }
+
+    setCommittingCatalogImport(true);
+    try {
+      const created = selectedPriceFile
+        ? await api.priceSources.commitSupplierCatalogImportFromFileBrowser(
+            activeProjectId,
+            {
+              supplier_name: catalogImportSupplierName.trim(),
+              path: selectedPriceFile.path,
+              reference: catalogImportReference.trim(),
+              priority: Number(catalogImportPriority) || 100,
+              notes: catalogImportNotes.trim(),
+              mapping: catalogImportMapping,
+            },
+          )
+        : await api.priceSources.commitSupplierCatalogImport(
+            activeProjectId,
+            {
+              supplier_name: catalogImportSupplierName.trim(),
+              reference: catalogImportReference.trim(),
+              priority: Number(catalogImportPriority) || 100,
+              notes: catalogImportNotes.trim(),
+              mapping_json: JSON.stringify(catalogImportMapping),
+            },
+            file as File,
+          );
+      await loadSupplierCatalogs(created.catalog_id);
+      await loadSupplierCatalogDetail(created.catalog_id);
+      resetCatalogImportState();
+      toast.success('Каталог импортирован');
+    } catch (error) {
+      toast.error(`Не удалось импортировать каталог: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setCommittingCatalogImport(false);
+    }
+  }, [
+    activeProjectId,
+    catalogImportMapping,
+    catalogImportNotes,
+    catalogImportPreview,
+    catalogImportPriority,
+    catalogImportReference,
+    catalogImportSupplierName,
+    loadSupplierCatalogDetail,
+    loadSupplierCatalogs,
+    priceFiles,
+    resetCatalogImportState,
+    selectedPriceFilePath,
+  ]);
+
+  useEffect(() => {
+    setSupplierCatalogs([]);
+    setSelectedCatalogId('');
+    setSelectedSupplierCatalog(null);
+    setPriceFiles([]);
+    setPriceFilesError('');
+    resetCatalogImportState();
+  }, [activeProjectId, resetCatalogImportState]);
+
+  useEffect(() => {
+    if (appMode !== 'catalogs' || !activeProjectId) return;
+    void loadSupplierCatalogs();
+    void loadPriceFiles();
+  }, [activeProjectId, appMode, loadPriceFiles, loadSupplierCatalogs]);
+
+  useEffect(() => {
+    if (appMode !== 'catalogs' || !activeProjectId || catalogImportMode || !selectedCatalogId) return;
+    void loadSupplierCatalogDetail(selectedCatalogId);
+  }, [activeProjectId, appMode, catalogImportMode, loadSupplierCatalogDetail, selectedCatalogId]);
+
+  const {
+    handleCreateProject,
+    handleUpload,
+    handleImportInbox,
+    handleUpdateScope,
+    handleSaveInstructions,
+    handleExtract,
+    handleBuildBom,
+    handleBuildEstimate,
+    handleExport,
+    handleSetEntityReviewStatus,
+    handleSaveEntity,
+    handleCreateEntity,
+    handleApproveVisible,
+    handleAnswerClarification,
+    handleApplyClarifications,
+    openEntity,
+    openNextEntity,
+    selectDocument,
+  } = useWorkflowActions({
+    activeProjectId,
+    selectedDocumentId,
+    canExtract,
+    canBuildBom,
+    canBuildEstimate,
+    canExport,
+    extractionMode,
+    pageFrom,
+    pageTo,
+    scope,
+    customScopeText,
+    extractionInstructions,
+    analysisInstructions,
+    assemblyMultiplier,
+    priceOverrides,
+    newProjectName,
+    selectedInboxPath,
+    selectedEntity,
+    clarifications: analysisClarifications,
+    activeJobStatus: activeOrLatestExtractJob?.status,
+    activeJobId: activeOrLatestExtractJob?.job_id ?? '',
+    reviewEntities,
+    entityForm,
+    manualEntityForm,
+    fileRef,
+    setWorkflow,
+    setCreatingProject,
+    setUploading,
+    setImportingInbox,
+    setSavingInstructions,
+    setRunningExtract,
+    setActiveExtractionJob,
+    setBuildingBom,
+    setPricingEstimate,
+    setSavingEntity,
+    setCreatingEntity,
+    setApprovingVisible,
+    setNewProjectName,
+    setProject,
+    setScope,
+    setExtractionInstructions,
+    setAnalysisInstructions,
+    setEntities,
+    setClarifications,
+    setEntityForm,
+    setManualEntityForm,
+    setBom,
+    setEstimate,
+    setAnsweringClarificationId,
+    setApplyingClarifications,
+    loadProjects,
+    loadProject,
+    loadInboxFiles,
+    rememberViewerPage,
+    reviewStatusLabel,
+  });
+
+  const sourceEvidence = useMemo(
+    () => (workflow.step === 'analysis' && selectedEntity ? selectedEntity.sources : []),
+    [selectedEntity, workflow.step],
+  );
+
+  const pageRangeLabel = pageFrom || pageTo ? `${pageFrom || '1'}-${pageTo || 'конец'}` : 'весь PDF';
+  const actionPaneProps = createWorkflowActionPaneViewModel({
+    currentStep,
+    upload: {
+      canWork,
+      creatingProject,
+      newProjectName,
+      onProjectNameChange: setNewProjectName,
+      onCreateProject: handleCreateProject,
+      fileRef,
+      uploading,
+      onUpload: handleUpload,
+      inboxFiles,
+      selectedInboxPath,
+      onInboxPathChange: setSelectedInboxPath,
+      loadingInbox,
+      onRefreshInbox: loadInboxFiles,
+      importingInbox,
+      onImportInbox: handleImportInbox,
+      inboxError,
+    },
+    config: {
+      scope,
+      scopeOptions,
+      scopeLabel,
+      onUpdateScope: handleUpdateScope,
+      pageFrom,
+      pageTo,
+      onPageFromChange: (value) =>
+        setWorkflow((current) => ({
+          ...current,
+          pageFrom: value,
+        })),
+      onPageToChange: (value) =>
+        setWorkflow((current) => ({
+          ...current,
+          pageTo: value,
+        })),
+      pageRangeLabel,
+      canWork,
+      extractionModeOptions,
+      extractionMode,
+      onExtractionModeChange: (mode) =>
+        setWorkflow((current) => ({
+          ...current,
+          extractionMode: mode,
+        })),
+      runningExtract,
+      customScopeText,
+      onCustomScopeTextChange: setCustomScopeText,
+      extractionInstructions,
+      onExtractionInstructionsChange: setExtractionInstructions,
+      analysisInstructions,
+      onAnalysisInstructionsChange: setAnalysisInstructions,
+      savingInstructions,
+      onSaveInstructions: handleSaveInstructions,
+      canExtract,
+      onExtract: handleExtract,
+    },
+    clarification: {
+      activeJobStatus: activeOrLatestExtractJob?.status,
+      activeJobStatusLabel: statusLabel(activeOrLatestExtractJob?.status),
+      activeJobStatusTone: statusTone(activeOrLatestExtractJob?.status),
+      processingMessage,
+      clarificationRequired,
+      openClarificationsCount,
+      clarifications: analysisClarifications,
+      answeringClarificationId,
+      applyingClarifications,
+      onAnswerClarification: handleAnswerClarification,
+      onApplyClarifications: handleApplyClarifications,
+      onOpenAnalysis: () =>
+        setWorkflow((current) => ({
+          ...current,
+          step: 'analysis',
+        })),
+    },
+    analysis: {
+      runningExtract,
+      processingMessage,
+      extractionProgress,
+      extractionIssue,
+      activeJobStatus: activeOrLatestExtractJob?.status,
+      activeJobStatusLabel: statusLabel(activeOrLatestExtractJob?.status),
+      activeJobStatusTone: statusTone(activeOrLatestExtractJob?.status),
+      clarificationRequired,
+      openClarificationsCount,
+      clarifications: analysisClarifications,
+      answeringClarificationId,
+      applyingClarifications,
+      onAnswerClarification: handleAnswerClarification,
+      onApplyClarifications: handleApplyClarifications,
+      reviewEntities,
+      draftCount,
+      reviewedCount,
+      rejectedCount,
+      canOpenResult: reviewEntities.length > 0 && draftCount === 0,
+      onOpenResult: () => {
+        if (!hasBom && canBuildBom) {
+          void handleBuildBom();
+          return;
+        }
+        setWorkflow((current) => ({
+          ...current,
+          step: 'result',
+          selectedEntityId: '',
+        }));
+      },
+      onApproveVisible: handleApproveVisible,
+      approvingVisible,
+      nextDraftEntity,
+      onOpenNextEntity: openNextEntity,
+      quickQuery,
+      onQuickQueryChange: (value) =>
+        setWorkflow((current) => ({
+          ...current,
+          quickQuery: value,
+        })),
+      reviewFilter,
+      onReviewFilterChange: (value) =>
+        setWorkflow((current) => ({
+          ...current,
+          reviewFilter: value,
+        })),
+      visibleEntities,
+      manualEntityForm,
+      onManualEntityFieldChange: (field, value) =>
+        setManualEntityForm((current) => ({
+          ...current,
+          [field]: value,
+        })),
+      creatingEntity,
+      onCreateEntity: handleCreateEntity,
+      selectedEntity,
+      onOpenEntity: openEntity,
+    },
+    result: {
+      canBuildBom,
+      buildingBom,
+      onBuildBom: handleBuildBom,
+      canBuildEstimate,
+      pricingEstimate,
+      onBuildEstimate: handleBuildEstimate,
+      hasBom,
+      bom,
+      estimate,
+      reviewEntitiesCount: reviewEntities.length,
+      equipmentTotal,
+      totalCost,
+      analysisInstructions,
+      bomPreviewItems,
+      assemblyMultiplier,
+      onAssemblyMultiplierChange: setAssemblyMultiplier,
+      priceSourcesCount,
+      activePriceOverrides,
+      priceOverrides,
+      onPriceOverrideChange: (key, value) =>
+        setPriceOverrides((current) => ({
+          ...current,
+          [key]: value,
+        })),
+      estimateNotes,
+      canExport,
+      onExport: handleExport,
+    },
+  });
+  const detailRailProps = createWorkflowDetailRailViewModel({
+    currentStep,
+    extractionInstructions,
+    analysisInstructions,
+    selection,
+    defaultModeLabel: extractionModeLabel(extractionMode),
+    runningExtract,
+    analysisModeLabel: extractionModeLabel(
+      (reviewEntities.length ? activeOrLatestExtractJob : latestProjectReviewJob)?.mode ?? extractionMode,
+    ),
+    analysisPagesLabel: pageRangeText(
+      (reviewEntities.length ? activeOrLatestExtractJob : latestProjectReviewJob)?.page_from,
+      (reviewEntities.length ? activeOrLatestExtractJob : latestProjectReviewJob)?.page_to,
+    ),
+    draftCount,
+    reviewedCount,
+    activeJobStatus: activeOrLatestExtractJob?.status,
+    activeJobStatusLabel: statusLabel(activeOrLatestExtractJob?.status),
+    activeJobStatusTone: statusTone(activeOrLatestExtractJob?.status),
+    extractionIssue,
+    processingMessage,
+    clarificationRequired,
+    openClarificationsCount,
+    clarifications: analysisClarifications,
+    selectedEntity,
+    entityForm,
+    onEntityFormFieldChange: (field, value) =>
+      setEntityForm((current) => ({
+        ...current,
+        [field]: value,
+      })),
+    savingEntity,
+    onSaveEntity: handleSaveEntity,
+    onSetEntityReviewStatus: handleSetEntityReviewStatus,
+    nextDraftEntity,
+    onOpenNextEntity: openNextEntity,
+    onCloseEntity: () =>
+      setWorkflow((current) => ({
+        ...current,
+        selectedEntityId: '',
+      })),
+    onRememberViewerPage: rememberViewerPage,
+    bom,
+    equipmentTotal,
+    totalCost,
+    statusLabel,
+  });
+
+  const handleDeleteProject = useCallback(async () => {
+    if (!activeProject) return;
+    const confirmed = window.confirm(`Удалить проект "${activeProject.name}" со всеми PDF и результатами?`);
+    if (!confirmed) return;
+
+    setLoading(true);
+    try {
+      await api.projects.delete(activeProject.project_id);
+      setWorkflow(createWorkflowSession());
+      setProject(null);
+      setJobs([]);
+      setEntities([]);
+      setClarifications([]);
+      setSelection(null);
+      setBom(null);
+      setEstimate(null);
+      setViewerPage(null);
+      await loadProjects('', true);
+      toast.success('Проект удалён');
+    } catch (error) {
+      toast.error(`Не удалось удалить проект: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [activeProject, loadProjects]);
+
   return (
-    <div className="flex flex-col h-screen bg-[#F8FAFC] font-sans text-[#1E293B] overflow-hidden">
-      {/* Header */}
-      <header className="h-[64px] flex items-center justify-between px-6 bg-white border-b border-[#E2E8F0] z-30 shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-[#2563EB] rounded-lg flex items-center justify-center text-white font-bold">
-            P
+    <div className={`workspace-shell ${isResizing ? 'is-resizing' : ''}`}>
+      <header className="workspace-header">
+        <div className="workspace-brand">
+          <div className="brand-mark">P</div>
+          <div>
+            <strong>PDF Спецификатор</strong>
+            <span>{project?.name ?? activeProject?.name ?? 'Проект не выбран'}</span>
           </div>
-          <span className="font-bold text-lg tracking-tight">PDF Спецификатор</span>
         </div>
 
-        <nav className="hidden md:flex items-center gap-8">
-          <StepIndicator current={project.currentStep} step="upload" icon={Upload} label="Загрузка" />
-          <StepIndicator current={project.currentStep} step="config" icon={Settings2} label="Настройка" />
-          <StepIndicator current={project.currentStep} step="analysis" icon={Cpu} label="Обработка" />
-          <StepIndicator current={project.currentStep} step="result" icon={ClipboardCheck} label="Результат" />
-        </nav>
+        <div className="workspace-modes" role="tablist" aria-label="Раздел приложения">
+          <button
+            type="button"
+            className={`workspace-mode ${appMode === 'workflow' ? 'active' : ''}`}
+            onClick={() => setAppMode('workflow')}
+          >
+            Спецификация
+          </button>
+          <button
+            type="button"
+            className={`workspace-mode ${appMode === 'catalogs' ? 'active' : ''}`}
+            onClick={() => setAppMode('catalogs')}
+            disabled={!activeProjectId}
+          >
+            Каталоги
+          </button>
+        </div>
 
-        <div className="flex items-center gap-4">
-          <span className="text-xs text-[#64748B]">Проект: {project.name}</span>
-          <div className="w-8 h-8 bg-[#F1F5F9] rounded-full border border-[#E2E8F0]" />
+        {appMode === 'workflow' ? (
+          <nav className="workflow-steps" aria-label="Этапы работы">
+            {workflowSteps.map((item) => (
+              <StepIndicator
+                key={item.step}
+                current={currentStep}
+                step={item.step}
+                label={item.label}
+                disabled={
+                  (item.step === 'config' && !selectedDocument) ||
+                  (item.step === 'clarification' && !analysisClarifications.length) ||
+                  (item.step === 'analysis' && !selectedDocument) ||
+                  (item.step === 'result' && !reviewEntities.length && !bom && !estimate)
+                }
+                onClick={() =>
+                  setWorkflow((current) => ({
+                    ...current,
+                    step: item.step,
+                  }))
+                }
+              />
+            ))}
+          </nav>
+        ) : (
+          <div className="workspace-section-label">
+            <strong>Каталоги поставщиков</strong>
+            <span>Импорт прайсов, preview и нормализация</span>
+          </div>
+        )}
+
+        <div className="header-actions">
+          <label className="project-switcher">
+            <span>Проект</span>
+            <select
+              value={activeProjectId}
+              onChange={(event) => loadProject(event.target.value)}
+              disabled={loading || !projects.length}
+            >
+              {projects.length ? (
+                projects.map((item) => (
+                  <option key={item.project_id} value={item.project_id}>
+                    {item.name}
+                  </option>
+                ))
+              ) : (
+                <option value="">Нет проектов</option>
+              )}
+            </select>
+          </label>
+          <button className="btn btn-secondary" onClick={() => loadProjects(activeProjectId, true)} disabled={loading}>
+            <RefreshCw size={16} />
+            Обновить
+          </button>
+          <button className="btn btn-danger" onClick={handleDeleteProject} disabled={loading || !activeProject}>
+            <Trash2 size={16} />
+            Удалить
+          </button>
         </div>
       </header>
 
-      {/* Main Workspace */}
-      <main className="flex-1 flex overflow-hidden relative">
-        {/* PDF Viewer */}
-        <div 
-          className="bg-[#525659] flex flex-col items-center overflow-hidden border-r border-[#E2E8F0] relative"
-          style={{ width: `${splitPosition}%` }}
-        >
-          {pdfUrl ? (
-            <PdfSourceViewer 
-              pdfUrl={pdfUrl} 
-              page={viewerPage} 
-              sources={sourceEvidence} 
-              onPageChange={setViewerPage} 
-            />
-          ) : (
-            <>
-              <div className="w-full h-[48px] bg-white border-b border-[#E2E8F0] flex items-center justify-between px-4 shrink-0 shadow-sm z-10 transition-colors">
-                <span className="text-[12px] font-bold text-[#64748B] uppercase tracking-wider">Просмотр документа</span>
+      {appMode === 'workflow' ? (
+        <main className="split-workspace">
+          <section className="pdf-pane" style={{ width: `${splitPosition}%` }}>
+            <div className="pdf-pane__bar">
+              <div>
+                <span>Документ</span>
+                <strong>{selectedDocument?.filename ?? 'PDF не загружен'}</strong>
               </div>
-              
-              <div className="flex-1 w-full overflow-auto p-12 flex flex-col items-center gap-6 scrollbar-hide">
-                <div className="mt-20 text-center group cursor-pointer" onClick={() => fileRef.current?.click()}>
-                  <div className="w-20 h-20 bg-white/10 backdrop-blur rounded-3xl border border-white/20 flex items-center justify-center text-white/50 mx-auto mb-4 group-hover:scale-105 transition-transform duration-500">
-                    <Upload size={32} />
-                  </div>
-                  <p className="text-white/60 text-sm font-medium">Выберите PDF для просмотра</p>
-                  <input ref={fileRef} type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} />
-                </div>
-              </div>
-            </>
-          )}
-        </div>
+              {documents.length > 1 ? (
+                <select value={selectedDocumentId} onChange={(event) => selectDocument(event.target.value)}>
+                  {documents.map((document) => (
+                    <option key={document.document_id} value={document.document_id}>
+                      {document.filename}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+            </div>
 
-        {/* Resizer */}
-        <div 
-          className={`w-px cursor-col-resize z-20 transition-all ${isResizing ? 'bg-[#2563EB] shadow-[0_0_8px_rgba(37,99,235,0.4)]' : 'bg-[#E2E8F0] hover:bg-[#2563EB]'}`}
-          onMouseDown={startResizing}
+            {selectedDocument ? (
+              <PdfSourceViewer
+                pdfUrl={viewerUrl}
+                page={viewerPage}
+                sources={sourceEvidence}
+                onPageChange={rememberViewerPage}
+              />
+            ) : (
+              <div className="pdf-empty">
+                <Upload size={34} />
+                <h2>Загрузите PDF</h2>
+                <p>После загрузки документ появится здесь. Левая и правая части экрана регулируются перетаскиванием границы.</p>
+              </div>
+            )}
+          </section>
+
+          <div
+            className="split-resizer"
+            onMouseDown={startResizing}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Изменить ширину просмотра PDF"
+          />
+
+          <WorkflowWorkspace
+            upload={actionPaneProps.upload}
+            config={actionPaneProps.config}
+            clarification={actionPaneProps.clarification}
+            analysis={actionPaneProps.analysis}
+            result={actionPaneProps.result}
+            detailRail={detailRailProps}
+          />
+        </main>
+      ) : (
+        <CatalogsPage
+          activeProjectName={project?.name ?? activeProject?.name ?? ''}
+          hasActiveProject={Boolean(activeProjectId)}
+          catalogs={supplierCatalogs}
+          loadingCatalogs={loadingCatalogs}
+          selectedCatalog={selectedSupplierCatalog}
+          selectedCatalogId={selectedCatalogId}
+          loadingCatalogDetail={loadingCatalogDetail}
+          importMode={catalogImportMode}
+          importSupplierName={catalogImportSupplierName}
+          importReference={catalogImportReference}
+          importPriority={catalogImportPriority}
+          importNotes={catalogImportNotes}
+          priceFiles={priceFiles}
+          selectedPriceFilePath={selectedPriceFilePath}
+          loadingPriceFiles={loadingPriceFiles}
+          priceFilesError={priceFilesError}
+          importPreview={catalogImportPreview}
+          importMapping={catalogImportMapping}
+          previewingImport={previewingCatalogImport}
+          committingImport={committingCatalogImport}
+          onRefresh={() => void loadSupplierCatalogs()}
+          onOpenCatalog={(catalogId) => {
+            setCatalogImportMode(false);
+            void loadSupplierCatalogDetail(catalogId);
+          }}
+          onStartImport={() => {
+            setCatalogImportMode(true);
+            setSelectedSupplierCatalog(null);
+            setSelectedCatalogId('');
+          }}
+          onCancelImport={resetCatalogImportState}
+          onImportSupplierNameChange={setCatalogImportSupplierName}
+          onImportReferenceChange={setCatalogImportReference}
+          onImportPriorityChange={setCatalogImportPriority}
+          onImportNotesChange={setCatalogImportNotes}
+          onRefreshPriceFiles={() => void loadPriceFiles(true)}
+          onImportPriceFilePathChange={(value) => {
+            setSelectedPriceFilePath(value);
+            resetCatalogImportPreview();
+            if (value && catalogImportFileRef.current) {
+              catalogImportFileRef.current.value = '';
+            }
+          }}
+          onImportLocalFileSelected={() => {
+            if (selectedPriceFilePath) {
+              setSelectedPriceFilePath('');
+            }
+            resetCatalogImportPreview();
+          }}
+          onPreviewImport={() => void handlePreviewSupplierCatalogImport()}
+          onCommitImport={() => void handleCommitSupplierCatalogImport()}
+          onImportMappingChange={(field, value) =>
+            setCatalogImportMapping((current) => ({
+              ...current,
+              [field]: value,
+            }))
+          }
+          importFileRef={catalogImportFileRef}
         />
-
-        {/* Action Pane */}
-        <div className="flex-1 bg-white flex flex-col relative overflow-hidden">
-          <div className="flex-1 overflow-y-auto p-10">
-            <AnimatePresence mode="wait">
-              {project.currentStep === 'upload' && (
-                <motion.div 
-                  key="upload"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="max-w-2xl mx-auto h-full flex flex-col items-center justify-center"
-                >
-                  <label 
-                    htmlFor="main-upload"
-                    className="w-full p-20 border border-[#E2E8F0] rounded-3xl bg-[#F9FAFB] hover:border-[#2563EB] hover:bg-[#EFF6FF] transition-all cursor-pointer group flex flex-col items-center text-center"
-                  >
-                    <div className="w-16 h-16 bg-white border border-[#E2E8F0] rounded-2xl flex items-center justify-center text-[#2563EB] mb-6 shadow-sm group-hover:scale-105 transition-transform duration-300">
-                      <Plus size={32} />
-                    </div>
-                    <span className="text-[18px] font-bold text-[#1E293B] mb-2 tracking-tight uppercase">Загрузить PDF Спецификацию</span>
-                    <span className="text-sm text-[#64748B]">Выберите проектную документацию для автоматического разбора состава и цен</span>
-                    <input id="main-upload" type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} />
-                  </label>
-                </motion.div>
-              )}
-
-              {project.currentStep === 'config' && (
-                <motion.div 
-                  key="config"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="max-w-3xl mx-auto flex flex-col gap-8"
-                >
-                  <header>
-                    <h2 className="text-[20px] font-bold tracking-tight text-[#1E293B]">Настройка параметров разбора</h2>
-                    <p className="text-sm text-[#64748B]">Уточните данные, чтобы агент подобрал оборудование максимально точно</p>
-                  </header>
-
-                  {/* Mode & Details */}
-                  <div className="grid grid-cols-2 gap-6">
-                    <div className="flex flex-col gap-3">
-                      <label className="text-[12px] font-bold text-[#64748B] uppercase tracking-wider">Выбор страниц</label>
-                      <input 
-                        type="text" 
-                        value={project.pagesRange || '47-71'}
-                        onChange={(e) => setProject(p => ({ ...p, pagesRange: e.target.value }))}
-                        className="p-3 border border-[#E2E8F0] rounded-lg bg-[#F9FAFB] text-sm focus:outline-none focus:border-[#2563EB]"
-                        placeholder="Напр: 47-71"
-                      />
-                    </div>
-                    <div className="flex flex-col gap-3">
-                      <label className="text-[12px] font-bold text-[#64748B] uppercase tracking-wider">Бренд оборудования</label>
-                      <div className="flex gap-2">
-                        <button 
-                          onClick={() => setProject(p => ({ ...p, analysisMode: 'ai' }))}
-                          className={`flex-1 py-2 rounded-lg border text-sm font-bold transition-all ${project.analysisMode === 'ai' ? 'border-[#2563EB] bg-[#EFF6FF] text-[#2563EB]' : 'border-[#E2E8F0] text-[#64748B] hover:border-slate-300'}`}
-                        >
-                          System Electric
-                        </button>
-                        <button 
-                          onClick={() => setProject(p => ({ ...p, analysisMode: 'basic' }))}
-                          className={`flex-1 py-2 rounded-lg border text-sm font-bold transition-all ${project.analysisMode === 'basic' ? 'border-[#2563EB] bg-[#EFF6FF] text-[#2563EB]' : 'border-[#E2E8F0] text-[#64748B] hover:border-slate-300'}`}
-                        >
-                          DKS (Оболочки)
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Instructions */}
-                  <div className="flex flex-col gap-3">
-                    <label className="text-[12px] font-bold text-[#64748B] uppercase tracking-wider">Инструкции для анализа</label>
-                    <p className="text-[12px] text-[#64748B] mb-1 italic leading-relaxed">
-                      Опишите задачу: на что обратить внимание или какие коэффициенты использовать. Например, «Стоимость сборки: x2 от оборудования».
-                    </p>
-                    <textarea 
-                      value={project.instructions}
-                      onChange={(e) => setProject(p => ({ ...p, instructions: e.target.value }))}
-                      placeholder="Пример: В файле есть линейные схемы на стр. 47..."
-                      rows={6}
-                      className="p-4 border border-[#E2E8F0] rounded-lg bg-[#F9FAFB] text-sm focus:outline-none focus:border-[#2563EB] resize-none leading-relaxed"
-                    />
-                  </div>
-
-                  <div className="pt-6 border-t border-[#E2E8F0] flex items-center justify-end gap-3 mt-auto">
-                    <button className="px-6 py-3 border border-[#E2E8F0] rounded-lg font-bold text-[#1E293B] hover:bg-[#F9FAFB] transition-colors">Отмена</button>
-                    <button 
-                      onClick={startAnalysis}
-                      className="px-8 py-3 bg-[#2563EB] text-white rounded-lg font-bold flex items-center gap-3 hover:bg-[#1D4ED8] transition-all shadow-lg shadow-blue-100"
-                    >
-                      <Cpu size={18} />
-                      <span>Запустить расчет состава</span>
-                    </button>
-                  </div>
-                </motion.div>
-              )}
-
-              {project.currentStep === 'analysis' && (
-                <motion.div 
-                  key="analysis"
-                  initial={{ opacity: 0, scale: 0.98 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="h-full flex flex-col items-center justify-center text-center p-10"
-                >
-                  <div className="bg-[#F0F9FF] border border-[#B9E6FE] rounded-2xl p-8 flex items-start gap-6 max-w-lg text-left shadow-sm">
-                    <div className="w-6 h-6 border-2 border-[#BAE6FD] border-t-[#0284C7] rounded-full animate-spin shrink-0" />
-                    <div>
-                      <h4 className="font-bold text-[16px] text-[#0369A1] mb-1">Идет инженерный разбор...</h4>
-                      <p className="text-sm text-[#0C4A6E] leading-relaxed mb-4">
-                        {project.statusMessage || 'Анализируем PDF и формируем спецификацию оборудования.'}
-                      </p>
-                      <div className="w-full bg-[#BAE6FD] h-1.5 rounded-full overflow-hidden mb-4">
-                        <motion.div 
-                          className="h-full bg-[#0284C7]"
-                          initial={{ width: "0%" }}
-                          animate={{ width: "100%" }}
-                          transition={{ duration: 45, ease: "linear" }}
-                        />
-                      </div>
-                      <span className="text-[11px] font-bold uppercase tracking-widest text-[#0C4A6E] opacity-50 italic">
-                        Фоновое извлечение может занять до 60 секунд.
-                      </span>
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-
-              {project.status === 'error' && (
-                <motion.div 
-                  key="error"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="h-full flex flex-col items-center justify-center text-center p-10"
-                >
-                   <div className="w-16 h-16 bg-rose-50 text-rose-500 rounded-2xl flex items-center justify-center border border-rose-100 mb-6 font-bold shadow-sm">
-                      !
-                   </div>
-                   <h3 className="font-bold text-[18px] text-[#1E293B] mb-2 uppercase tracking-wide">Ошибка выполнения</h3>
-                   <p className="text-sm text-[#64748B] max-w-sm mb-8 leading-relaxed italic">{project.error}</p>
-                   <button 
-                    onClick={() => setProject(p => ({ ...p, currentStep: 'config', status: 'idle' }))}
-                    className="px-6 py-2 bg-[#2563EB] text-white rounded-lg font-bold hover:bg-blue-700 transition-colors"
-                  >
-                    Попробовать снова
-                  </button>
-                </motion.div>
-              )}
-
-              {project.currentStep === 'result' && project.status === 'success' && (
-                <motion.div 
-                  key="results"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="w-full flex flex-col gap-6"
-                >
-                  <header className="flex items-center justify-between border-b border-[#E2E8F0] pb-6">
-                    <div>
-                      <h2 className="text-[20px] font-bold tracking-tight text-[#1E293B]">Спецификация комплектующих</h2>
-                      <p className="text-sm text-[#64748B]">Предварительный состав оборудования на основе анализа схем</p>
-                    </div>
-                    <div className="flex gap-2">
-                      <button 
-                        onClick={handleAddItem}
-                        className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-[var(--color-primary)] rounded-lg font-bold text-sm border border-indigo-100 hover:bg-indigo-100 transition-colors"
-                      >
-                        <Plus size={16} /> Добавить позицию
-                      </button>
-                      <button className="p-2 border border-[#E2E8F0] rounded-lg text-[#64748B] hover:bg-[#F9FAFB]"><Download size={18}/></button>
-                      <button className="p-2 border border-[#E2E8F0] rounded-lg text-[#64748B] hover:bg-[#F9FAFB]"><Share2 size={18}/></button>
-                    </div>
-                  </header>
-
-                  <div className="border border-[#E2E8F0] rounded-xl overflow-hidden bg-white shadow-sm">
-                    <table className="w-full text-left border-collapse text-sm">
-                      <thead className="bg-[#F8FAFC] border-b border-[#E2E8F0]">
-                        <tr>
-                          <th className="px-6 py-4 font-bold text-[11px] text-[#64748B] uppercase tracking-widest italic">Наименование</th>
-                          <th className="px-6 py-3 font-bold text-[11px] text-[#64748B] uppercase tracking-widest italic">Артикул</th>
-                          <th className="px-4 py-3 font-bold text-[11px] text-[#64748B] uppercase tracking-widest text-center italic">Кол-во</th>
-                          <th className="px-6 py-3 font-bold text-[11px] text-[#64748B] uppercase tracking-widest text-right italic">Сумма</th>
-                          <th className="px-4 py-3 w-20"></th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#E2E8F0]">
-                        {project.results?.map(item => (
-                          <tr key={item.id} className={`hover:bg-[#F8FAFC] transition-colors ${editingItemId === item.id ? 'bg-indigo-50/30' : ''}`}>
-                            <td className="px-6 py-3">
-                              {editingItemId === item.id ? (
-                                <input 
-                                  value={item.name}
-                                  onChange={(e) => handleUpdateItem(item.id, { name: e.target.value })}
-                                  className="w-full bg-white border border-indigo-200 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-indigo-100"
-                                />
-                              ) : (
-                                <span className="font-medium text-[#1E293B]">{item.name}</span>
-                              )}
-                            </td>
-                            <td className="px-6 py-3">
-                              {editingItemId === item.id ? (
-                                <input 
-                                  value={item.article || ''}
-                                  onChange={(e) => handleUpdateItem(item.id, { article: e.target.value })}
-                                  className="w-full bg-white border border-indigo-200 rounded px-2 py-1 font-mono text-xs"
-                                />
-                              ) : (
-                                <span className="font-mono text-[12px] text-[#64748B] uppercase opacity-70">{item.article}</span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3 text-center">
-                              {editingItemId === item.id ? (
-                                <div className="flex items-center justify-center gap-1">
-                                  <input 
-                                    type="number"
-                                    value={item.qty}
-                                    onChange={(e) => handleUpdateItem(item.id, { qty: Number(e.target.value) })}
-                                    className="w-14 bg-white border border-indigo-200 rounded px-2 py-1 text-center"
-                                  />
-                                  <span className="text-[10px] text-slate-400">{item.unit}</span>
-                                </div>
-                              ) : (
-                                <span className="text-[#1E293B] font-bold italic">{item.qty} {item.unit}</span>
-                              )}
-                            </td>
-                            <td className="px-6 py-3 text-right">
-                              {editingItemId === item.id ? (
-                                <input 
-                                  type="number"
-                                  value={item.price}
-                                  onChange={(e) => handleUpdateItem(item.id, { price: Number(e.target.value) })}
-                                  className="w-24 bg-white border border-indigo-200 rounded px-2 py-1 text-right tabular-nums font-bold"
-                                />
-                              ) : (
-                                <span className="font-bold text-[#1E293B] tabular-nums">{item.total.toLocaleString()} ₽</span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="flex items-center justify-end gap-1">
-                                {editingItemId === item.id ? (
-                                  <button 
-                                    onClick={() => setEditingItemId(null)}
-                                    className="p-1.5 bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
-                                    title="Сохранить"
-                                  >
-                                    <CheckCircle2 size={14} />
-                                  </button>
-                                ) : (
-                                  <button 
-                                    onClick={() => setEditingItemId(item.id)}
-                                    className="p-1.5 text-slate-400 hover:text-[var(--color-primary)] hover:bg-indigo-50 rounded transition-all"
-                                    title="Изменить"
-                                  >
-                                    <Settings2 size={14} />
-                                  </button>
-                                )}
-                                <button 
-                                  onClick={() => handleDeleteItem(item.id)}
-                                  className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-all"
-                                  title="Удалить"
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                      <tfoot className="bg-[#F1F5F9] border-t border-[#E2E8F0] text-[var(--color-text-main)]">
-                        <tr className="font-bold">
-                          <td colSpan={3} className="px-6 py-5 text-sm uppercase tracking-widest">Итого по оборудованию</td>
-                          <td className="px-6 py-5 text-right text-lg border-l border-[#E2E8F0]">
-                            {project.results?.reduce((acc, curr) => acc + curr.total, 0).toLocaleString()} ₽
-                          </td>
-                        </tr>
-                      </tfoot>
-                    </table>
-                  </div>
-
-                  <div className="flex items-center justify-end gap-3 mt-6">
-                    <button 
-                      onClick={() => setProject(p => ({ ...p, currentStep: 'config', status: 'idle' }))}
-                      className="px-6 py-3 border border-[#E2E8F0] rounded-lg font-bold text-[#64748B] hover:bg-[#F9FAFB] transition-colors"
-                    >
-                      Начать заново
-                    </button>
-                    <button className="px-8 py-3 bg-[#2563EB] text-white rounded-lg font-bold hover:bg-[#1D4ED8] transition-all shadow-lg shadow-blue-100">
-                      Сформировать КП
-                    </button>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-
-          {/* Persistent Footer Stats */}
-          <footer className="h-[64px] bg-[#F8FAFC] border-t border-[#E2E8F0] px-10 flex items-center justify-between shrink-0">
-             <div className="flex gap-8">
-               <div className="flex flex-col gap-0.5">
-                 <span className="text-[10px] font-bold text-[#64748B] uppercase tracking-widest">API Status</span>
-                 <span className="text-[12px] font-bold text-[#10B981] flex items-center gap-1.5 leading-none">
-                    <div className="w-1.5 h-1.5 bg-[#10B981] rounded-full" /> Online
-                 </span>
-               </div>
-               <div className="flex flex-col gap-0.5">
-                 <span className="text-[10px] font-bold text-[#64748B] uppercase tracking-widest">Лимит агента</span>
-                 <span className="text-[12px] font-bold text-[#1E293B] leading-none tracking-tight">85% доступно</span>
-               </div>
-             </div>
-             <p className="text-[12px] text-[#64748B] italic font-medium">Ваш расчет будет сохранен в разделе "История проектов"</p>
-          </footer>
-        </div>
-      </main>
-      <Toaster position="bottom-right" theme="light" expand richColors />
+      )}
     </div>
   );
 }
